@@ -5,9 +5,9 @@ import os
 import re
 import sys
 
-# .env, .env.local, config/.env — да; .env.example — нет
-ENV = re.compile(r"(?<![\w.-])\.env(?:\.(?!example\b)[\w-]+)?(?![\w.-])")
-KEY = re.compile(r"[\w-]\.(?:pem|key)(?![\w.-])")
+# .env, .env.local, .envrc, config/.env — да; .env.example — нет. Регистр не важен: на macOS .ENV — тот же файл
+ENV = re.compile(r"(?<![\w.-])\.env(?:rc|\.(?!example\b)[\w-]+)?(?![\w.-])", re.I)
+KEY = re.compile(r"[\w-]\.(?:pem|key)(?![\w.-])|\bid_(?:rsa|dsa|ecdsa|ed25519)\b(?!\.pub)", re.I)
 
 
 def is_secret(text: str) -> bool:
@@ -18,18 +18,22 @@ def main() -> int:
     event = json.load(sys.stdin)
     tool = event.get("tool_name", "")
     args = event.get("tool_input", {})
-    if tool == "Bash":
+    if tool in ("Bash", "Monitor"):
         targets = [args.get("command", "")]
     else:
-        # у Grep pattern — искомый текст, не путь; у Glob — путь
-        keys = ("file_path", "path", "pattern") if tool == "Glob" else ("file_path", "path")
-        targets = [args.get(k, "") for k in keys]
+        # у Grep pattern — искомый текст, не путь, а glob — фильтр файлов; у Glob pattern — путь
+        keys = {"Glob": ("path", "pattern"), "Grep": ("path", "glob")}.get(tool, ("file_path", "path", "notebook_path"))
+        targets = [os.path.basename(args.get(k) or "") for k in keys]
     for t in targets:
-        if t and is_secret(os.path.basename(t) if tool != "Bash" else t):
+        if t and is_secret(t):
             print(f"secret-guard: доступ к секретам закрыт ({tool}). Нужен ключ — попроси человека.", file=sys.stderr)
             return 2
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except Exception as e:  # упавший гейт закрывает: exit 1 Claude Code считает «пропустить»
+        print(f"secret-guard: сбой гейта ({e!r}), действие остановлено.", file=sys.stderr)
+        sys.exit(2)
