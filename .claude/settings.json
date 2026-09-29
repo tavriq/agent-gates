@@ -1,8 +1,17 @@
 {
+  "permissions": {
+    "defaultMode": "acceptEdits",
+    "allow": [
+      "Bash(.venv/bin/python -m pytest:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)"
+    ]
+  },
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash",
+        "matcher": "Bash|Monitor",
         "hooks": [
           { "type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/branch_guard.py\"" },
           { "type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/secret_guard.py\"" },
@@ -10,7 +19,7 @@
         ]
       },
       {
-        "matcher": "Read|Edit|Write|Grep|Glob",
+        "matcher": "Read|Edit|Write|Grep|Glob|NotebookEdit",
         "hooks": [
           { "type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/secret_guard.py\"" }
         ]
