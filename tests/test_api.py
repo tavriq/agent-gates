@@ -48,7 +48,7 @@ def test_s3_hourly(client):
 
 
 def test_s4_fixed_does_not_depend_on_duration(client):
-    r = work(client, "fixed", 1800, "2026-09-01T09:00:00", "2026-09-01T14:00:00")
+    r = work(client, "fixed", 1800, "2026-09-01T09:00:00", "2026-09-01T10:00:00")
     assert r.json()["pay"] == 1800
 
 

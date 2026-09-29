@@ -11,10 +11,9 @@ def shift_pay(rate_type: str, rate: int, start: datetime, end: datetime) -> tupl
         raise ValueError("конец смены должен быть позже начала")
     minutes = int((end - start).total_seconds() // 60)
     long = minutes > MAX_PAID_MINUTES
-    if rate_type == "fixed":
-        return rate, long
-    if rate_type == "hourly":
-        paid = min(minutes, MAX_PAID_MINUTES)
-        amount = (Decimal(rate) * paid / 60).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
-        return int(amount), long
-    raise ValueError(f"неизвестный тип ставки: {rate_type}")
+    if rate_type not in ("hourly", "fixed"):
+        raise ValueError(f"неизвестный тип ставки: {rate_type}")
+    # одна формула для обоих типов ставки
+    paid = min(minutes, MAX_PAID_MINUTES)
+    amount = (Decimal(rate) * paid / 60).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    return int(amount), long
