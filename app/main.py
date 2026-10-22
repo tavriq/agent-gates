@@ -1,4 +1,4 @@
-"""HTTP API: объекты, сотрудники, смены, ведомость. Хранение — в памяти процесса."""
+"""HTTP API: парковки, машины, стоянки, выписка. Хранение — в памяти процесса."""
 from datetime import date, datetime
 from itertools import count
 from typing import Literal
@@ -6,16 +6,16 @@ from typing import Literal
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from app.pay import shift_pay
+from app.fee import parking_fee
 
-app = FastAPI(title="agent-gates: смены и оплата")
+app = FastAPI(title="agent-gates: платная парковка")
 
 
 class Store:
     def __init__(self) -> None:
-        self.sites: dict[int, dict] = {}
-        self.employees: dict[int, dict] = {}
-        self.shifts: dict[int, dict] = {}
+        self.lots: dict[int, dict] = {}
+        self.cars: dict[int, dict] = {}
+        self.sessions: dict[int, dict] = {}
         self.ids = count(1)
 
 
@@ -27,86 +27,86 @@ def reset_store() -> None:
     store = Store()
 
 
-class SiteIn(BaseModel):
+class LotIn(BaseModel):
     name: str
-    rate_type: Literal["hourly", "fixed"]
+    tariff: Literal["hourly", "fixed"]
     rate: int = Field(gt=0)
 
 
-class EmployeeIn(BaseModel):
-    name: str
+class CarIn(BaseModel):
+    plate: str
 
 
-class ShiftOpen(BaseModel):
-    employee_id: int
-    site_id: int
+class SessionOpen(BaseModel):
+    car_id: int
+    lot_id: int
     start: datetime
 
 
-class ShiftClose(BaseModel):
+class SessionClose(BaseModel):
     end: datetime
 
 
-@app.post("/sites", status_code=201)
-def create_site(body: SiteIn) -> dict:
-    site = {"id": next(store.ids), **body.model_dump()}
-    store.sites[site["id"]] = site
-    return site
+@app.post("/lots", status_code=201)
+def create_lot(body: LotIn) -> dict:
+    lot = {"id": next(store.ids), **body.model_dump()}
+    store.lots[lot["id"]] = lot
+    return lot
 
 
-@app.post("/employees", status_code=201)
-def create_employee(body: EmployeeIn) -> dict:
-    employee = {"id": next(store.ids), **body.model_dump()}
-    store.employees[employee["id"]] = employee
-    return employee
+@app.post("/cars", status_code=201)
+def create_car(body: CarIn) -> dict:
+    car = {"id": next(store.ids), **body.model_dump()}
+    store.cars[car["id"]] = car
+    return car
 
 
-@app.post("/shifts", status_code=201)
-def open_shift(body: ShiftOpen) -> dict:
-    if body.employee_id not in store.employees:
-        raise HTTPException(404, "сотрудник не найден")
-    if body.site_id not in store.sites:
-        raise HTTPException(404, "объект не найден")
-    if any(s["employee_id"] == body.employee_id and s["status"] == "open" for s in store.shifts.values()):
-        raise HTTPException(409, "у сотрудника уже есть открытая смена")
-    shift = {
+@app.post("/sessions", status_code=201)
+def open_session(body: SessionOpen) -> dict:
+    if body.car_id not in store.cars:
+        raise HTTPException(404, "машина не найдена")
+    if body.lot_id not in store.lots:
+        raise HTTPException(404, "парковка не найдена")
+    if any(s["car_id"] == body.car_id and s["status"] == "open" for s in store.sessions.values()):
+        raise HTTPException(409, "у машины уже есть открытая стоянка")
+    session = {
         "id": next(store.ids),
         **body.model_dump(),
         "end": None,
         "status": "open",
-        "pay": None,
+        "fee": None,
         "long": False,
     }
-    store.shifts[shift["id"]] = shift
-    return shift
+    store.sessions[session["id"]] = session
+    return session
 
 
-@app.post("/shifts/{shift_id}/close")
-def close_shift(shift_id: int, body: ShiftClose) -> dict:
-    shift = store.shifts.get(shift_id)
-    if shift is None:
-        raise HTTPException(404, "смена не найдена")
-    if shift["status"] == "closed":
-        raise HTTPException(409, "смена уже закрыта")
-    site = store.sites[shift["site_id"]]
+@app.post("/sessions/{session_id}/close")
+def close_session(session_id: int, body: SessionClose) -> dict:
+    session = store.sessions.get(session_id)
+    if session is None:
+        raise HTTPException(404, "стоянка не найдена")
+    if session["status"] == "closed":
+        raise HTTPException(409, "стоянка уже закрыта")
+    lot = store.lots[session["lot_id"]]
     try:
-        pay, long = shift_pay(site["rate_type"], site["rate"], shift["start"], body.end)
+        fee, long = parking_fee(lot["tariff"], lot["rate"], session["start"], body.end)
     except ValueError as e:
         raise HTTPException(422, str(e))
-    shift.update(end=body.end, status="closed", pay=pay, long=long)
-    return shift
+    session.update(end=body.end, status="closed", fee=fee, long=long)
+    return session
 
 
-@app.get("/payroll")
-def payroll(date_from: date, date_to: date) -> list[dict]:
+@app.get("/statement")
+def statement(date_from: date, date_to: date) -> list[dict]:
     rows: dict[int, dict] = {}
-    for s in store.shifts.values():
+    for s in store.sessions.values():
         if s["status"] != "closed" or not (date_from <= s["start"].date() < date_to):
             continue
         row = rows.setdefault(
-            s["employee_id"],
-            {"employee_id": s["employee_id"], "name": store.employees[s["employee_id"]]["name"], "shifts": 0, "total": 0},
+            s["car_id"],
+            {"car_id": s["car_id"], "plate": store.cars[s["car_id"]]["plate"], "sessions": 0, "total": 0},
         )
-        row["shifts"] += 1
-        row["total"] += s["pay"]
-    return sorted(rows.values(), key=lambda r: r["employee_id"])
+        row["sessions"] += 1
+        row["total"] += s["fee"]
+    return sorted(rows.values(), key=lambda r: r["car_id"])
