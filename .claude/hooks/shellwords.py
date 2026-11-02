@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 SEPARATORS = ";&|()<>\n"
 DYNAMIC = re.compile(r"[$`]")
 # git, /usr/bin/git, $(git, `git, git-commit; но не .git/hooks и не --git-dir
-GIT = re.compile(r"(?:^|[=(`/])git(?:-([a-z][a-z-]*))?$")
+GIT = re.compile(r"(?:^|[=(`/!])git(?:-([a-z][a-z-]*))?$")  # ! — алиас-команда: -c alias.x='!git …'
 ANSI_C = re.compile(r"\$'((?:[^'\\]|\\.)*)'", re.S)
 # <<EOF, <<-EOF, <<'EOF', <<"EOF", <<\EOF; но не <<< (here-string)
 HEREDOC = re.compile(r"(?<!<)<<(-?)[ \t]*(?:'(\w+)'|\"(\w+)\"|\\(\w+)|(\w+))")
@@ -90,6 +90,10 @@ OPTIONS = {
                     "--force --move --copy --delete --all --remotes --list --show-current --verbose --quiet --track "
                     "--no-track --unset-upstream --edit-description --create-reflog --ignore-case --color --no-color"),
     "update-ref": _opts("m", "", "--stdin --no-deref --create-reflog"),
+    "symbolic-ref": _opts("m", "", "--quiet --short --delete --no-recurse --recurse"),
+    "subtree": _opts("Pbm", "--prefix --branch --message --onto --annotate", "--squash --rejoin --ignore-joins --quiet --debug"),
+    "http-push": _opts("", "", "--all --force --dry-run --verbose"),
+    "remote": _opts("tm", "", "--mirror --fetch --tags --no-tags --verbose --push --add --delete --prune --dry-run"),
     "send-pack": _opts("", "--receive-pack --exec --push-option", "--all --mirror --force --dry-run --atomic --stdin "
                        "--thin --no-thin --quiet --verbose --signed --force-with-lease"),
     "config": _opts("f", "--file --blob --type --default --comment", "--add --replace-all --unset --unset-all --get "
@@ -133,7 +137,30 @@ class GitCall:
     args: Args
     dynamic: str  # первое слово из переменной или подстановки, "" — таких нет
     rough: bool  # команду не удалось разобрать по кавычкам — слова грубые
-    config: list = field(default_factory=list)  # git -c ключ=значение
+    # настройки этой команды: -c, --config-env, GIT_CONFIG_* — [(ключ, значение)]; значение None — не видно,
+    # ключ "*" — подменён весь файл настроек
+    config: list = field(default_factory=list)
+    env: dict = field(default_factory=dict)  # GIT_…=… перед git, кроме GIT_DIR и GIT_WORK_TREE
+
+
+def _config_pair(text):
+    key, eq, value = text.partition("=")
+    return key, value if eq else "true"
+
+
+def _env_config(env):
+    pairs = []
+    for name, value in env.items():
+        n = re.fullmatch(r"GIT_CONFIG_KEY_(\d+)", name)
+        if n:
+            pairs.append((value, env.get(f"GIT_CONFIG_VALUE_{n.group(1)}")))
+        elif name == "GIT_CONFIG_PARAMETERS":
+            pairs += [_config_pair(p) for p in value.split()]
+        elif name in ("GIT_CONFIG", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"):
+            pairs.append(("*", None))
+        elif name == "GIT_NOTES_REF":
+            pairs.append(("core.notesref", value))
+    return pairs
 
 
 def _ansi_c(body: str) -> str:
@@ -289,29 +316,38 @@ def _parse_git(words: list, rough: bool):
             break
     else:
         return None
-    where, glob, config, i, sub = [], [], [], start + 1, m.group(1)
+    where, glob, env, i, sub = [], [], {}, start + 1, m.group(1)
     for w0 in words[:start]:  # GIT_DIR=… git commit — то же, что git --git-dir=… commit
         name, eq, val = w0.partition("=")
-        if eq and name in ENV_LOCATION:
-            where.append(f"{ENV_LOCATION[name]}={val}")
+        if eq and name.startswith("GIT_"):
             glob.append(w0)
+            if name in ENV_LOCATION:
+                where.append(f"{ENV_LOCATION[name]}={val}")
+            else:
+                env[name] = val
+    config = _env_config(env)
     if not sub:
         while i < len(words) and words[i].startswith("-"):
             opt = words[i]
             glob.append(opt)
             i += 1
+            name, eq, val = opt.partition("=")
             if opt in GLOBAL_VALUE and i < len(words):
                 glob.append(words[i])
                 if opt in LOCATION:
                     where += [opt, words[i]]
                 if opt == "-c":
-                    config.append(words[i])
+                    config.append(_config_pair(words[i]))
+                if opt == "--config-env":  # значение — в переменной окружения, гейту не видно
+                    config.append((words[i].partition("=")[0], None))
                 i += 1
-            elif opt.partition("=")[0] in LOCATION:
+            elif name in LOCATION:
                 where.append(opt)
+            elif name == "--config-env" and eq:
+                config.append((val.partition("=")[0], None))
         if i >= len(words):  # подкоманды нет; но если путь из подстановки — это всё равно стоп
             dynamic = next((t for t in glob if DYNAMIC.search(t)), "")
-            return (GitCall(where, "", [], Args(), dynamic, rough, config), i) if dynamic else None
+            return (GitCall(where, "", [], Args(), dynamic, rough, config, env), i) if dynamic else None
         sub, i = words[i], i + 1
     rest = words[i:]
     if "`" in w:  # `git status` — вызов кончается на закрывающей обратной кавычке
@@ -327,7 +363,7 @@ def _parse_git(words: list, rough: bool):
     args = parse_args(sub, rest, rough)
     words_checked = glob + [sub] + [r for j, r in enumerate(rest) if j not in args.message]
     dynamic = next((t for t in words_checked if DYNAMIC.search(t)), "")
-    return GitCall(where, sub, rest, args, dynamic, rough, config), i  # i — где в words начинается rest
+    return GitCall(where, sub, rest, args, dynamic, rough, config, env), i  # i — где в words начинается rest
 
 
 def _substitutions(word: str):

@@ -47,7 +47,7 @@
 | # | Дано: ветка или состояние | Команда | Ожидание |
 |---|---|---|---|
 | G1.1 | main | `git commit`, в том числе `--amend` | стоп |
-| G1.2 | main | `git merge <ветка>`, `git cherry-pick`, `git revert`, `git am` | стоп |
+| G1.2 | main | `git merge <ветка>`, `git cherry-pick`, `git revert`, `git am`, `git subtree`, `git citool` | стоп |
 | G1.3 | main | `git rebase …`; посреди rebase main — `git rebase --continue`, `git commit` | стоп |
 | G1.4 | любая | `git rebase <база> main`, `git rebase --root main` | стоп |
 | G1.5 | main | `git reset --hard [<ревизия>]` | стоп |
@@ -55,18 +55,19 @@
 | G1.7 | main | `git reset`, `git reset <путь>`, `git reset -- <путь>` — снять с индекса | можно |
 | G1.8 | main | `git pull`, `git pull --rebase` | стоп |
 | G1.9 | main | `git pull --ff-only`, `git pull --ff-only origin main` | можно |
-| G1.10 | main | `git pull --ff-only origin <другая ветка>` | стоп |
+| G1.10 | main | `git pull --ff-only origin <другая ветка>`; `git pull --ff-only`, когда upstream main (`branch.main.merge`) — другая ветка | стоп |
 | G1.11 | любая | `git switch -C main`, `git checkout -B main`, `git worktree add -B main` | стоп |
 | G1.12 | любая | `git branch -f main`, `git branch -m/-M/-c/-C <ветка> main`, `git branch -m main <имя>` | стоп |
 | G1.13 | любая | `git update-ref refs/heads/main …`, `git update-ref --stdin`, `git fast-import` | стоп |
-| G1.14 | любая | `git fetch <remote> <ветка>:main`, источник — не main | стоп |
+| G1.14 | любая | `git fetch <remote> <ветка>:main`, источник — не main; fetch и pull, когда так велит настройка `remote.*.fetch` | стоп |
 | G1.15 | любая | push в main: с main, `origin main`, `HEAD:main`, `+main`, `refs/heads/main`, `--all`, `--mirror`, `*` | стоп |
 | G1.16 | main | `--abort` у rebase, merge, cherry-pick, revert, am | можно |
-| G1.17 | любая | переключиться на существующую ветку и коммит, push, reset одной командой | стоп |
+| G1.17 | любая | переключиться на существующую ветку и коммит, push, reset одной командой; переключиться на main и `git reset <ревизия>` одной командой — `HEAD~1`, `@{-1}` вычисляются уже после переключения | стоп |
 | G1.18 | любая | `git filter-branch …`, `git filter-repo …` — переписывают историю тех веток, что выберут их аргументы | стоп |
 | G1.19 | ветка | commit, merge, `rebase main`, `reset --hard`, `pull`, push своей ветки | можно |
-| G1.20 | ветка | `git symbolic-ref HEAD refs/heads/main && git commit` — переключение на main без checkout | стоп |
-| G1.21 | ветка | push в main через настройку: `git -c remote.origin.push=HEAD:main push`, `git config remote.origin.push …`, `git config push.default …`; `git send-pack` — как push. Чтение настройки — можно | стоп |
+| G1.20 | ветка | `git symbolic-ref [-m …] HEAD refs/heads/main && git commit` — переключение на main без checkout | стоп |
+| G1.21 | ветка | push, pull или fetch в main через настройку: `-c`, `--config-env`, `GIT_CONFIG_*`, `GIT_CONFIG_GLOBAL` перед git, запись `git config` (`remote.*.push`, `remote.*.mirror`, `remote.*.fetch` в ветку main, `push.default upstream/matching`, `branch.main.merge`), `git remote add --mirror`. Уже записанные настройки гейт читает перед push, pull и fetch. `git send-pack`, в том числе `--stdin`, — как push. Чтение и удаление настройки — можно | стоп |
+| G1.22 | ветка | `git rebase --update-refs` и `rebase.updateRefs`; `git notes --ref=refs/heads/main` и `GIT_NOTES_REF`; `git branch -u <не main> main`; `git fetch --refmap=…:refs/heads/main`; `git subtree push … main`, `git subtree split --branch main`; `git http-push … :main` — переносят main или готовят перенос | стоп |
 | G2.1 | — | `cat .en''v`, `cat .e\nv`, `cat ".en"v`, `cat $'\x2eenv'`, `cat .e$"n"v` | стоп |
 | G2.2 | main | `git co''mmit`, `git "com"mit`, `git com\mit` | стоп |
 | G2.3 | любая | `c=commit; git $c`, `git $(printf com)mit` | стоп, сообщение «из переменной или подстановки» |
@@ -79,4 +80,4 @@
 | G4.3 | рабочая копия красная | `git add -A && git commit`, `git commit -a` | стоп |
 | G4.4 | тест зависит от неотслеживаемого файла | `git commit -a` | стоп: файл в коммит не уйдёт |
 | G4.5 | в индексе красный тест, путь коммита — другой файл | `git commit <путь>` | можно |
-| G4.6 | — | `git stash && git commit`, `git commit && git commit` | стоп |
+| G4.6 | — | `git stash && git commit`, `git commit && git commit`, `GIT_INDEX_FILE=… git commit` | стоп |

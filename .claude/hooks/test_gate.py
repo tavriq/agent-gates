@@ -39,7 +39,14 @@ def predict(calls, k, cwd, tmp) -> dict:
     commit = calls[k]
     where = commit.where
     index = os.path.join(tmp, "index")
-    gitdir = git(cwd, where, "rev-parse", "--absolute-git-dir").stdout.strip()
+    gitdirs = {}
+
+    def gitdir_of(w):  # git -C . и git без -C — одна копия
+        if tuple(w) not in gitdirs:
+            gitdirs[tuple(w)] = git(cwd, w, "rev-parse", "--absolute-git-dir").stdout.strip() or tuple(w)
+        return gitdirs[tuple(w)]
+
+    gitdir = gitdir_of(where)
     if gitdir and os.path.exists(os.path.join(gitdir, "index")):  # у worktree свой индекс — в его git-папке
         # copy2, а не copyfile: со свежим mtime копии git поверит stat-данным и пропустит правку
         # того же размера в ту же секунду (racy git)
@@ -50,7 +57,7 @@ def predict(calls, k, cwd, tmp) -> dict:
             c.args.values.keys() & {"-c", "--create", "-b", "--orphan"})
         if c.sub in READONLY or new_branch_only:
             continue
-        if c.sub not in ("add", "rm") or c.where != where:
+        if c.sub not in ("add", "rm") or gitdir_of(c.where) != gitdir:
             raise Stop(f"git {c.sub} до коммита в той же команде меняет индекс так, что гейт не может предсказать "
                        "содержимое коммита. Выполни её отдельной командой, коммит — следующей.")
         if c.args.flags & INTERACTIVE:
@@ -109,6 +116,9 @@ def main() -> int:
     k = commits[0]
     commit = calls[k]
     for c in calls[:k + 1]:
+        if c.sub not in READONLY and (c.env.keys() & {"GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY"}):
+            raise Stop(f"git {c.sub} с GIT_INDEX_FILE/GIT_OBJECT_DIRECTORY работает с другим индексом — "
+                       "гейт не может проверить, что уйдёт в коммит.")
         if c.dynamic and c.sub not in READONLY:
             raise Stop(f"в git {c.sub} слово {c.dynamic} берётся из переменной или подстановки — "
                        "гейт не может предсказать содержимое коммита.")

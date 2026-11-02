@@ -2,6 +2,7 @@
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -231,14 +232,50 @@ def commit_all(repo, msg):
     assert git(repo, "commit", "-q", "-m", msg).returncode == 0
 
 
-@pytest.fixture
-def history(repo):
-    """main с двумя коммитами, feat/x — на том же коммите."""
+@pytest.fixture(scope="session")
+def built(tmp_path_factory):
+    """Состояние репозитория собирается один раз за прогон, тест получает свою копию. git init и коммиты
+    в каждом тесте занимали больше половины прогона, а test-gate гоняет его перед каждым коммитом."""
+    cache = {}
+
+    def copy(name, build, dst):
+        if name not in cache:
+            src = tmp_path_factory.mktemp("template") / name
+            subprocess.run(["git", "init", "-q", "-b", "main", str(src)], check=True)
+            build(src)
+            cache[name] = src
+        shutil.copytree(cache[name], dst, symlinks=True)
+        return dst
+
+    return copy
+
+
+def build_history(r):
     for n in (1, 2):
-        (repo / "f.txt").write_text(f"{n}\n")
-        commit_all(repo, f"c{n}")
-    git(repo, "branch", "feat/x")
-    return repo
+        (r / "f.txt").write_text(f"{n}\n")
+        commit_all(r, f"c{n}")
+    git(r, "branch", "feat/x")
+
+
+def build_diverged(r):
+    build_history(r)
+    git(r, "switch", "-q", "feat/x")
+    (r / "f.txt").write_text("x\n")
+    commit_all(r, "x")
+
+
+def build_rebasing_main(r):
+    build_diverged(r)
+    git(r, "switch", "-q", "main")
+    (r / "f.txt").write_text("m\n")
+    commit_all(r, "m")
+    assert git(r, "rebase", "feat/x").returncode != 0
+
+
+@pytest.fixture
+def history(built, tmp_path):
+    """main с двумя коммитами, feat/x — на том же коммите."""
+    return built("history", build_history, tmp_path / "repo")
 
 
 @pytest.fixture
@@ -248,16 +285,15 @@ def on_feature(history):
 
 
 @pytest.fixture
-def rebasing_main(history):
+def diverged(built, tmp_path):
+    """feat/x на коммит впереди main, HEAD — на feat/x."""
+    return built("diverged", build_diverged, tmp_path / "repo")
+
+
+@pytest.fixture
+def rebasing_main(built, tmp_path):
     """rebase main встал на конфликте: HEAD отцеплен, а переписывается main."""
-    git(history, "switch", "-q", "feat/x")
-    (history / "f.txt").write_text("x\n")
-    commit_all(history, "x")
-    git(history, "switch", "-q", "main")
-    (history / "f.txt").write_text("m\n")
-    commit_all(history, "m")
-    assert git(history, "rebase", "feat/x").returncode != 0
-    return history
+    return built("rebasing_main", build_rebasing_main, tmp_path / "repo")
 
 
 # G1. branch-guard: история main — только через PR
@@ -313,14 +349,6 @@ def test_g1_sync_and_unstage_on_main_allowed(history, cmd):
 
 # G1: равносильные записи тех же команд — сокращённые опции, «--», heads/main, -C . (найдено на приёмке)
 
-@pytest.fixture
-def diverged(on_feature):
-    """feat/x на коммит впереди main, HEAD — на feat/x."""
-    (on_feature / "f.txt").write_text("x\n")
-    commit_all(on_feature, "x")
-    return on_feature
-
-
 @pytest.mark.parametrize("cmd", [
     "git rebase -- feat/x main", "git rebase --whitespace fix feat/x main", "git rebase -C 1 feat/x main",
     "git rebase --empty drop feat/x main", "git rebase --ont feat/x HEAD~1 main", "git rebase --roo main",
@@ -365,6 +393,81 @@ def test_g1_main_moved_by_plumbing_or_config_blocked(diverged, cmd):
 
 @pytest.mark.parametrize("cmd", ["git config push.default", "git config --get remote.origin.push", "git config user.email t@t"])
 def test_g1_reading_config_allowed(diverged, cmd):
+    assert run("branch_guard.py", bash(cmd, diverged))[0] == 0
+
+
+# G1: найдено на повторной приёмке — reset после switch, symbolic-ref -m, перенаправление настройками
+
+@pytest.mark.parametrize("cmd", [
+    "git switch main && git reset --soft HEAD~1", "git checkout main && git reset HEAD~1",
+    "git switch main && git reset --soft @{-1}", "git switch main && git reset --keep @{-1}",
+    "git switch main && git reset --soft HEAD@{1}",
+])
+def test_g1_relative_reset_after_switch_blocked(diverged, cmd):
+    assert run("branch_guard.py", bash(cmd, diverged))[0] == 2
+
+
+@pytest.mark.parametrize("cmd", [
+    "git symbolic-ref -m why HEAD refs/heads/main && git commit -m x",
+    "git send-pack --stdin origin",
+    "V=HEAD:main git --config-env=remote.origin.push=V push origin",
+    "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=remote.origin.push GIT_CONFIG_VALUE_0=HEAD:main git push origin",
+    "GIT_CONFIG_GLOBAL=/tmp/other git push origin",
+    "git remote add --mirror=push m /tmp/m",
+    "git -c branch.main.remote=origin -c branch.main.merge=refs/heads/feat/x pull --ff-only origin",
+    "git -c remote.origin.fetch=+refs/heads/feat/x:refs/heads/main fetch origin",
+    "git config --add remote.origin.fetch +refs/heads/feat/x:refs/heads/main",
+    "git config branch.main.merge refs/heads/feat/x",
+    "git branch -u origin/feat/x main", "git branch --set-upstream-to=origin/feat/x main",
+    "git rebase --update-refs origin/dev", "git -c rebase.updateRefs=true rebase origin/dev",
+    "git notes --ref=refs/heads/main add -m x", "GIT_NOTES_REF=refs/heads/main git notes add -m x",
+    "git -c alias.x='!git branch -f main HEAD' x",
+    "git fetch --refmap=+refs/heads/feat/x:refs/heads/main origin feat/x",
+    "git subtree push --prefix=lib origin main", "git subtree split --prefix=lib --branch main",
+    "git http-push https://example.invalid/r.git HEAD:main",
+])
+def test_g1_main_moved_through_settings_blocked(diverged, cmd):
+    assert run("branch_guard.py", bash(cmd, diverged))[0] == 2
+
+
+@pytest.mark.parametrize("cmd", ["git subtree add --prefix=lib . feat/x", "git citool", "git -c alias.ci=commit ci -m x"])
+def test_g1_other_commits_on_main_blocked(history, cmd):
+    assert run("branch_guard.py", bash(cmd, history))[0] == 2
+
+
+def test_g1_alias_or_external_command(history):
+    """Что сделает алиас или git-<имя>, гейт не видит: на main и с push в main — стоп, как было на dev."""
+    assert run("branch_guard.py", bash("git lfs ls-files", history))[0] == 0
+    git(history, "switch", "-q", "feat/x")
+    assert run("branch_guard.py", bash("git -c alias.p=push p origin main", history))[0] == 2
+    assert run("branch_guard.py", bash("git -c alias.ci=commit ci -m x", history))[0] == 0
+
+
+def test_g1_push_and_fetch_settings_in_repo_checked(diverged):
+    """Настройки, записанные заранее (в том числе правкой .git/config), гейт читает перед push и fetch."""
+    git(diverged, "config", "remote.origin.push", "refs/heads/feat/x:refs/heads/main")
+    assert run("branch_guard.py", bash("git push origin", diverged))[0] == 2
+    # refspec без ":" git тоже отображает по remote.origin.push — так проверено на настоящем git
+    assert run("branch_guard.py", bash("git push origin feat/x", diverged))[0] == 2
+    assert run("branch_guard.py", bash("git push origin feat/x:feat/x", diverged))[0] == 0
+    git(diverged, "config", "--add", "remote.origin.fetch", "+refs/heads/feat/x:refs/heads/main")
+    assert run("branch_guard.py", bash("git fetch origin", diverged))[0] == 2
+
+
+def test_g1_pull_on_main_checks_upstream(history):
+    git(history, "config", "branch.main.merge", "refs/heads/feat/x")
+    assert run("branch_guard.py", bash("git pull --ff-only", history))[0] == 2
+    assert run("branch_guard.py", bash("git pull --ff-only origin main", history))[0] == 0
+
+
+@pytest.mark.parametrize("cmd", [
+    "git config --get remote.origin.push HEAD", "git config remote.origin.fetch +refs/heads/*:refs/remotes/origin/*",
+    "git config push.default current", "git config branch.feat/x.merge refs/heads/feat/x",
+    "git config --unset remote.origin.push", "git branch -u origin/main", "git branch -u origin/main main",
+    "git rebase --no-update-refs main", "git notes add -m x", "git remote add up /tmp/up", "git remote update",
+    "git fetch origin",
+])
+def test_g1_settings_that_keep_main_allowed(diverged, cmd):
     assert run("branch_guard.py", bash(cmd, diverged))[0] == 0
 
 
@@ -483,14 +586,16 @@ BROKEN = "def add(a, b):\n    return a - b\n"
 TEST_CALC = "from calc import add\n\n\ndef test_add():\n    assert add(2, 2) == 4\n"
 
 
+def build_project(r):
+    (r / "calc.py").write_text(CALC)
+    (r / "test_calc.py").write_text(TEST_CALC)
+    commit_all(r, "init")
+
+
 @pytest.fixture
-def project(tmp_path):
+def project(built, tmp_path):
     """git-репозиторий: в HEAD код и зелёный тест на него."""
-    subprocess.run(["git", "init", "-q", "-b", "main", str(tmp_path)], check=True)
-    (tmp_path / "calc.py").write_text(CALC)
-    (tmp_path / "test_calc.py").write_text(TEST_CALC)
-    commit_all(tmp_path, "init")
-    return tmp_path
+    return built("project", build_project, tmp_path / "project")
 
 
 def gate(cmd, cwd):
@@ -562,3 +667,12 @@ def test_g4_heredoc_message_with_quotes_allowed(project, cmd):
 @pytest.mark.parametrize("cmd", UNQUOTED_SUBSTITUTION[:2])
 def test_g4_repo_from_substitution_blocked(project, cmd):
     assert gate(cmd, project)[0] == 2
+
+
+def test_g4_other_index_blocked(project):
+    assert gate("GIT_INDEX_FILE=/tmp/other-index git commit -m x", project)[0] == 2
+
+
+def test_g4_same_copy_through_dash_c_allowed(project):
+    (project / "calc.py").write_text(CALC + "# ok\n")
+    assert gate("git -C . add -A && git commit -m x", project)[0] == 0
