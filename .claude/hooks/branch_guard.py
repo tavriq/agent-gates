@@ -314,6 +314,36 @@ def check(call, branch, head, cwd):
     return None, None
 
 
+def location(cwd, where):
+    """Папка, куда ведут -C команды; None — если место задано и чем-то кроме -C."""
+    parts, i = [cwd], 0
+    while i < len(where):
+        if where[i] != "-C" or i + 1 >= len(where):
+            return None
+        parts.append(where[i + 1])
+        i += 2
+    return os.path.normpath(os.path.join(*parts))
+
+
+def worktree_branch(a):
+    """Ветка нового worktree: -b/-B, ревизия, иначе ветка с именем папки (git так и делает)."""
+    new = a.values.get("-b") or a.values.get("-B")
+    if new:
+        return "main" if protected(new) else new
+    if "--detach" in a.flags:
+        return SWITCHED
+    ops = a.operands
+    name = ops[2] if len(ops) > 2 else os.path.basename(os.path.normpath(ops[1]))
+    return "main" if protected(name) else SWITCHED
+
+
+def autocorrect(cwd, call) -> bool:
+    """help.autocorrect включён: опечатку в подкоманде git исправит и выполнит сам."""
+    values = [v for k, v in call.config if k.lower() == "help.autocorrect"] or [
+        v for _, v in settings(cwd, call, r"^help\.autocorrect$")]
+    return bool(values) and (values[-1] or "").lower() not in ("0", "false", "off", "no", "show", "never", "prompt")
+
+
 def main() -> int:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from shellwords import BUILTINS, expand_aliases, git_calls
@@ -326,6 +356,7 @@ def main() -> int:
     # гейт смотрит до запуска, поэтому проходит команду по вызовам git и следит, на какой ветке окажется агент.
     # Ключ — git-папка рабочей копии: git -C . и git без -C — одна и та же копия
     repos, branches, moved = {}, {}, set()
+    worktrees = {}  # путь → ветка worktree, созданного в этой команде
     stale = False  # до этого вызова в команде были git-команды, которые могут сдвинуть ветки или ссылки
     # алиас — из -c этой команды или из настроек — проверяется как то, во что он раскрыт
     for call in expand_aliases(list(git_calls(cmd)), cwd):
@@ -340,10 +371,16 @@ def main() -> int:
             stale = stale or call.sub not in REF_NEUTRAL
             continue
         where = tuple(call.where)
-        if where not in repos:
-            r = git(cwd, call.where, "rev-parse", "--absolute-git-dir")
-            repos[where] = r.stdout.strip() if r.returncode == 0 else where
-        key = repos[where]
+        place = location(cwd, call.where)
+        fresh = next((p for p in worktrees if place and (place == p or place.startswith(p + os.sep))), None)
+        if fresh:  # worktree, созданный раньше в этой же команде: его ветка известна из worktree add
+            key = ("worktree", fresh)
+            branches.setdefault(key, worktrees[fresh])
+        else:
+            if where not in repos:
+                r = git(cwd, call.where, "rev-parse", "--absolute-git-dir")
+                repos[where] = r.stdout.strip() if r.returncode == 0 else where
+            key = repos[where]
 
         def branch(key=key, where=call.where):
             if key not in branches:
@@ -360,6 +397,9 @@ def main() -> int:
             if pushes or (on_main(branch()) and ALIAS_ON_MAIN.search(text)):
                 reason = (f"git {call.sub} — алиас или внешняя команда; на main или с push в main гейт её не пропускает: "
                           "не видно, что она сделает.")
+            elif autocorrect(cwd, call):
+                reason = (f"git {call.sub} — не команда git, а при help.autocorrect git сам выполнит похожую "
+                          "встроенную (comit → commit). Напиши команду без опечатки.")
         if reason and branches.get(key) == SWITCHED:
             # остановило бы и на обычной ветке? Тогда настоящая причина — она; иначе мешает только неизвестная ветка
             reason = check(call, lambda: "", head, cwd)[0] or (
@@ -370,6 +410,9 @@ def main() -> int:
         if after is not None:
             branches[key] = after
             moved.add(key)
+        if call.sub == "worktree" and call.args.operands[:1] == ["add"] and len(call.args.operands) > 1:
+            worktrees[os.path.normpath(os.path.join(location(cwd, call.where) or cwd, call.args.operands[1]))] = \
+                worktree_branch(call.args)
     return 0
 
 

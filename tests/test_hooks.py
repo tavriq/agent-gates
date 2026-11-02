@@ -472,6 +472,38 @@ def test_g1_third_review_neighbours_allowed(history, cmd):
     assert run("branch_guard.py", bash(cmd, history))[0] == 0
 
 
+# Найдено на четвёртой приёмке: «#» посреди слова прятал остаток строки от гейтов
+
+@pytest.mark.parametrize("cmd", [
+    "git status a#b; git commit -m x", "echo $# && git commit -m x", "git log -1 --format=%h#%s && git commit -m x",
+    "git -c help.autocorrect=immediate comit -m x",
+])
+def test_g1_hash_inside_word_on_main_blocked(history, cmd):
+    assert run("branch_guard.py", bash(cmd, history))[0] == 2
+
+
+def test_g1_push_after_url_with_anchor_blocked(diverged):
+    assert run("branch_guard.py", bash("echo see https://x.invalid/y#readme && git push origin HEAD:main", diverged))[0] == 2
+
+
+def test_g1_autocorrect_from_settings_blocked(history):
+    git(history, "config", "help.autocorrect", "1")
+    assert run("branch_guard.py", bash("git comit -m x", history))[0] == 2
+
+
+def test_g1_worktree_created_in_same_command_tracked(diverged):
+    (diverged / "wt").mkdir()  # пустая папка заранее: git -C wt до worktree add смотрит в родительскую копию
+    assert run("branch_guard.py", bash("git worktree add wt main && git -C wt commit -m x", diverged))[0] == 2
+
+
+@pytest.mark.parametrize("cmd", ["echo $# && git commit -m x", "git log -1 --format=%h#%s && git commit -m x"])
+def test_g4_hash_inside_word_does_not_hide_commit(project, cmd):
+    (project / "calc.py").write_text(BROKEN)
+    git(project, "add", "calc.py")
+    code, err = gate(cmd, project)
+    assert code == 2 and "1 failed" in err
+
+
 def test_g1_aliases_from_settings_expanded(history):
     git(history, "config", "alias.ci", "commit")
     git(history, "config", "alias.pm", "push origin HEAD:main")

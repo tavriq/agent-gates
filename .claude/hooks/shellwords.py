@@ -228,6 +228,9 @@ def _word_lists(text: str):
         lex = shlex.shlex(text, posix=True, punctuation_chars=SEPARATORS)
         lex.whitespace = " \t\r"
         lex.whitespace_split = True
+        # shlex по умолчанию режет «комментарий» с # и посреди слова: a#b, $#, URL#якорь прятали остаток строки.
+        # В bash # — комментарий только в начале слова; гейт комментариев не вырезает вовсе: лишнее слово — не пропуск
+        lex.commenters = ""
         tokens = []
         for t in lex:  # группы знаков (&&, )|) — по одному: дальше важен каждый
             tokens.extend(t) if t and all(ch in SEPARATORS for ch in t) else tokens.append(t)
