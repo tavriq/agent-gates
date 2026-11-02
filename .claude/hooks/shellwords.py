@@ -20,7 +20,8 @@ ANSI_C = re.compile(r"\$'((?:[^'\\]|\\.)*)'", re.S)
 HEREDOC = re.compile(r"(?<!<)<<(-?)[ \t]*(?:'(\w+)'|\"(\w+)\"|\\(\w+)|(\w+))")
 # commit -m "$(cat <<'EOF' … EOF)": тело heredoc в кавычках не исполняется — это текст сообщения
 CAT_HEREDOC = re.compile(r"\$\(\s*cat\s+<<-?\s*'(\w+)'[ \t]*\n(.*)\n[ \t]*\1[ \t]*\n\s*\)", re.S)
-MAX_DEPTH = 4
+MAX_DEPTH = 8
+ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 
 # глобальные опции git со значением отдельным словом
 GLOBAL_VALUE = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env", "--super-prefix", "--attr-source"}
@@ -187,10 +188,14 @@ def _ansi_c(body: str) -> str:
         return body
 
 
+def _join_lines(text: str) -> str:
+    """\\ + перевод строки — склейка строк; \\\\ + перевод строки — обычный конец строки (\\ экранирован)."""
+    return re.sub(r"(?<!\\)((?:\\\\)*)\\\n", r"\1", text)
+
+
 def _prepare(text: str, quote) -> str:
-    """\\ + перевод строки — склейка строк; $'…' — строка с escape-последовательностями; $"…" — то же, что "…"."""
-    text = text.replace("\\\n", "")
-    text = ANSI_C.sub(lambda m: quote(_ansi_c(m.group(1))), text)
+    """Склейка строк; $'…' — строка с escape-последовательностями; $"…" — то же, что "…"."""
+    text = ANSI_C.sub(lambda m: quote(_ansi_c(m.group(1))), _join_lines(text))
     return text.replace('$"', '"')
 
 
@@ -221,24 +226,78 @@ def _heredocs(text: str) -> str:
     return text if pending else "\n".join(out)
 
 
+def _strip_comments(text: str) -> str:
+    """Вырезает комментарии так, как bash: # в начале слова вне кавычек — до конца строки.
+    Кавычки внутри $(…) и `…` считаются заново, как в bash; # посреди слова (a#b, $#, URL#якорь) — не комментарий."""
+    out, stack, i, n = [], ["top"], 0, len(text)
+    while i < n:
+        c, ctx = text[i], stack[-1]
+        if ctx == "sq":
+            if c == "'":
+                stack.pop()
+        elif c == "\\":
+            out.append(text[i:i + 2])
+            i += 2
+            continue
+        elif ctx == "dq":
+            if c == '"':
+                stack.pop()
+            elif text.startswith("$(", i):
+                stack.append("sub")
+                out.append("$(")
+                i += 2
+                continue
+            elif c == "`":
+                stack.append("bt")
+        else:  # top, sub, paren, bt — код шелла
+            prev = text[i - 1] if i else "\n"
+            if c == "#" and (prev.isspace() or prev in ";&|()<>`"):
+                j = text.find("\n", i)
+                i = n if j < 0 else j
+                continue
+            if c == "'":
+                stack.append("sq")
+            elif c == '"':
+                stack.append("dq")
+            elif text.startswith("$(", i):
+                stack.append("sub")
+                out.append("$(")
+                i += 2
+                continue
+            elif c == "(":
+                stack.append("paren")
+            elif c == ")" and ctx in ("sub", "paren"):
+                stack.pop()
+            elif c == "`":
+                if ctx == "bt":
+                    stack.pop()
+                else:
+                    stack.append("bt")
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
 def _word_lists(text: str):
     """→ (слова, rough). Сначала честно по кавычкам; не вышло (кавычка без пары) — грубо: кавычки долой, режем везде."""
-    text = _heredocs(_prepare(text, shlex.quote))
+    text = _strip_comments(_prepare(_heredocs(text), shlex.quote))
     try:
         lex = shlex.shlex(text, posix=True, punctuation_chars=SEPARATORS)
         lex.whitespace = " \t\r"
         lex.whitespace_split = True
-        # shlex по умолчанию режет «комментарий» с # и посреди слова: a#b, $#, URL#якорь прятали остаток строки.
-        # В bash # — комментарий только в начале слова; гейт комментариев не вырезает вовсе: лишнее слово — не пропуск
+        # shlex по умолчанию режет «комментарий» с # и посреди слова (a#b, $#, URL#якорь); комментарии уже
+        # вырезаны по правилу bash в _strip_comments
         lex.commenters = ""
         tokens = []
         for t in lex:  # группы знаков (&&, )|) — по одному: дальше важен каждый
             tokens.extend(t) if t and all(ch in SEPARATORS for ch in t) else tokens.append(t)
-    except ValueError:
-        for part in re.split(r"[;&|()<>\n]+", text):
+    except ValueError:  # кавычка без пары: bash выполнит строки до неё — смотрим всё и грубо
+        for part in re.split(r"[;&|()<>\n`]+", text):
             words = re.sub(r"[\"'\\]", "", part).split()
-            if words:
-                yield words, True
+            starts = [k for k, w in enumerate(words) if _is_git(w)] or [0]
+            for a, b in zip([0] + starts[1:], starts[1:] + [len(words)]):
+                if words[a:b]:
+                    yield words[a:b], True
         return
     words, i = [], 0
     while i < len(tokens):
@@ -278,11 +337,8 @@ def parse_args(sub: str, rest: list, rough: bool) -> Args:
     short_m, long_m = MESSAGE_OPTS.get(sub, ("", set()))
     a = Args()
 
-    def message(j):
+    def message(j):  # в грубом разборе текстом считается только само значение: остальное проверяется
         a.message.add(j)
-        if rough:  # где кончается сообщение, в грубом разборе не видно: всё до конца — текст
-            a.message.update(range(j, len(rest)))
-            return True
         return False
 
     j = 0
@@ -327,13 +383,20 @@ def parse_args(sub: str, rest: list, rough: bool) -> Args:
     return a
 
 
+def _is_git(word: str) -> bool:
+    # X=git и GIT_EXEC_PATH=…/git-core — присваивания; x=`git …` и x=$(git …) — вызов git в подстановке
+    return bool(GIT.search(word)) and not (ASSIGNMENT.match(word) and not re.search(r"[`(]", word))
+
+
 def _parse_git(words: list, rough: bool):
-    for start, w in enumerate(words):
-        m = GIT.search(w)
-        if m:
-            break
-    else:
+    starts = [k for k, w in enumerate(words) if _is_git(w)]
+    if not starts:
         return None
+    start = starts[0]
+    while start + 1 < len(words) and _is_git(words[start + 1]):  # sudo -u git git …, nice git git …
+        start += 1
+    w = words[start]
+    m = GIT.search(w)
     where, glob, env, i, sub = [], [], {}, start + 1, m.group(1)
     for w0 in words[:start]:  # GIT_DIR=… git commit — то же, что git --git-dir=… commit
         name, eq, val = w0.partition("=")
@@ -385,17 +448,33 @@ def _parse_git(words: list, rough: bool):
 
 
 def _substitutions(word: str):
-    """(начало, конец, содержимое) каждой $(…) и `…` в слове — их содержимое исполняется."""
-    for m in re.finditer(r"`([^`]*)`", word):
-        yield m.start(), m.end(), m.group(1)
-    i = word.find("$(")
-    while i != -1:
-        depth, j = 1, i + 2
-        while j < len(word) and depth:
-            depth += {"(": 1, ")": -1}.get(word[j], 0)
-            j += 1
-        yield i, j, word[i + 2:j - 1]
-        i = word.find("$(", j)
+    """(начало, конец, содержимое) каждой $(…) и `…` в слове — их содержимое исполняется.
+    Внутри $(…) кавычки считаются заново, как в bash: $(echo ')'; …) не закрывается на ')' в кавычках.
+    Конца не нашли — содержимое до конца слова."""
+    i, n = 0, len(word)
+    while i < n:
+        if word.startswith("$(", i):
+            j, depth = i + 2, 1
+            while j < n and depth:
+                c = word[j]
+                if c == "\\":
+                    j += 2
+                    continue
+                if c in "'\"":
+                    k = word.find(c, j + 1)
+                    j = n if k < 0 else k + 1
+                    continue
+                depth += {"(": 1, ")": -1}.get(c, 0)
+                j += 1
+            yield i, j, word[i + 2:j - 1 if depth == 0 else j]
+            i = j
+        elif word[i] == "`":
+            k = word.find("`", i + 1)
+            end = n if k < 0 else k + 1
+            yield i, end, word[i + 1:k if k >= 0 else n]
+            i = end
+        else:
+            i += 1
 
 
 def _is_text(word: str) -> bool:
@@ -433,9 +512,13 @@ def expand_aliases(calls, cwd, depth=0):
 
 def git_calls(text: str, depth: int = 0):
     """Вызовы git в команде, в порядке исполнения: подстановки и sh -c "…" — тоже."""
+    if depth >= MAX_DEPTH:  # вложенность глубже — не разбираем, но и не пропускаем
+        if "git" in text:
+            yield GitCall([], "", [], Args(), f"<вложенность глубже {MAX_DEPTH}>", False)
+        return
     for words, rough in _word_lists(text):
         call, offset = _parse_git(words, rough) or (None, 0)
-        if not rough and depth < MAX_DEPTH:
+        if not rough:
             for i, w in enumerate(words):
                 if call and i - offset in call.args.message and _is_text(w):
                     continue  # сообщение коммита из heredoc в кавычках — только текст

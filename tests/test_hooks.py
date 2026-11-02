@@ -2,6 +2,7 @@
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -502,6 +503,60 @@ def test_g4_hash_inside_word_does_not_hide_commit(project, cmd):
     git(project, "add", "calc.py")
     code, err = gate(cmd, project)
     assert code == 2 and "1 failed" in err
+
+
+# Найдено на пятой приёмке: где разбор терял часть команды
+
+def nested(cmd, levels):
+    for _ in range(levels):
+        cmd = "sh -c " + shlex.quote(cmd)
+    return cmd
+
+
+PARSE_LOSS_COMMIT = [
+    "git status \\\\\ngit commit -m x",  # \\ в конце строки — экранированная косая, строка кончается
+    "X=git git commit -m x",  # X=git — присваивание, а не сам git
+    "x=`git commit -m y`",  # а x=`git …` — вызов git в подстановке
+    "git tag -m \"$(echo ')'; git commit -m y)\" v1",  # ')' в кавычках не закрывает $(…)
+    "git tag -m #'\ngit commit -m x\n#'",  # #' — комментарий bash, а не начало строки в кавычках
+    "git tag -m `git commit -m y` v1\necho \"x",  # кавычка без пары ниже не прячет строки выше
+]
+
+
+@pytest.mark.parametrize("cmd", PARSE_LOSS_COMMIT)
+def test_g1_parse_loss_on_main_blocked(history, cmd):
+    assert run("branch_guard.py", bash(cmd, history))[0] == 2
+
+
+@pytest.mark.parametrize("cmd", [
+    "git status \\\\\ngit push origin HEAD:main",
+    "GIT_EXEC_PATH=/usr/lib/git-core git push origin HEAD:main",
+    "git commit -m \"$(echo ')'; git push origin HEAD:main)\"",
+    "git commit -m #'\ngit push origin HEAD:main\n#'",
+    "git commit -m \"$(cat <<'EOF'\nmsg\\\nEOF\ngit push origin HEAD:main\nEOF\n)\"",  # \ перед EOF в <<'EOF' — не склейка
+    "git commit -m `git push origin HEAD:main`\necho \"unbalanced",
+    nested("git push origin HEAD:main", 9),
+])
+def test_g1_parse_loss_push_from_feature_blocked(diverged, cmd):
+    assert run("branch_guard.py", bash(cmd, diverged))[0] == 2
+
+
+@pytest.mark.parametrize("cmd", ["git status # проверка", "git commit -m x # заметка", "echo a#b && git log -1"])
+def test_g1_real_comment_allowed(diverged, cmd):
+    assert run("branch_guard.py", bash(cmd, diverged))[0] == 0
+
+
+@pytest.mark.parametrize("cmd", PARSE_LOSS_COMMIT + ["GIT_EXEC_PATH=/usr/lib/git-core git commit -m x"])
+def test_g4_parse_loss_does_not_hide_commit(project, cmd):
+    (project / "calc.py").write_text(BROKEN)
+    git(project, "add", "calc.py")
+    code, err = gate(cmd, project)
+    assert code == 2 and "1 failed" in err
+
+
+def test_g4_real_comment_after_commit_allowed(project):
+    (project / "calc.py").write_text(CALC + "# ok\n")
+    assert gate("git add -A && git commit -m x # заметка", project)[0] == 0
 
 
 def test_g1_aliases_from_settings_expanded(history):
