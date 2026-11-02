@@ -19,7 +19,12 @@ def main() -> int:
     tool = event.get("tool_name", "")
     args = event.get("tool_input", {})
     if tool in ("Bash", "Monitor"):
-        targets = [args.get("command", "")]
+        # разбор шелла нужен только командам: Read, Edit и прочие от него не зависят
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from shellwords import normalize
+
+        cmd = args.get("command", "")
+        targets = [cmd, normalize(cmd)]  # .en''v, .e\nv, $'\x2eenv' — это тоже .env (SPEC.md, G2)
     else:
         # у Grep pattern — искомый текст, не путь, а glob — фильтр файлов; у Glob pattern — путь
         keys = {"Glob": ("path", "pattern"), "Grep": ("path", "glob")}.get(tool, ("file_path", "path", "notebook_path"))
