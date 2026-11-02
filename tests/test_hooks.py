@@ -435,6 +435,62 @@ def test_g1_other_commits_on_main_blocked(history, cmd):
     assert run("branch_guard.py", bash(cmd, history))[0] == 2
 
 
+# G1: найдено на третьей приёмке — bisect, шаблон refspec, настройки из окружения, алиасы, reset после fetch
+
+@pytest.mark.parametrize("cmd", [
+    "git bisect reset && git commit -m x", "git bisect start && git bisect reset main && git commit -m x",
+    "git fetch origin '+refs/heads/feat/*:refs/heads/*'", "git fetch origin 'refs/heads/*:refs/heads/*'",
+    "GIT_CONFIG_PARAMETERS=\"'remote.origin.push=HEAD:main'\" git push origin",
+    "HOME=/tmp/other-home git push origin", "XDG_CONFIG_HOME=/tmp/other-xdg git push origin",
+    "GIT_COMMON_DIR=/tmp/other/.git git push origin feat/x:feat/x",
+    "git --config-env=include.path=E push origin feat/x:feat/x",
+    "git -c alias.p='push origin HEAD:main' p", "git -c alias.x='!git branch -f main HEAD' x",
+    "git symbolic-ref refs/heads/main refs/heads/feat/x", "git fetch /tmp/other-repo main:main",
+    "git -c notes.rewriteRef=refs/heads/main commit --amend -m x", "git branch -f MAIN HEAD",
+    "git push origin HEAD:refs/heads//main",
+])
+def test_g1_third_review_bypasses_from_feature_blocked(diverged, cmd):
+    assert run("branch_guard.py", bash(cmd, diverged))[0] == 2
+
+
+@pytest.mark.parametrize("cmd", [
+    "git -c alias.p=push p", "git -c alias.p=push p origin",
+    "git fetch origin && git reset --soft origin/main",
+    "git update-ref refs/remotes/origin/main feat/x && git reset --keep origin/main",
+    "git fetch . feat/x:refs/remotes/origin/main && git reset --soft origin/main",
+    "git pull --ff-only /tmp/other-repo main", "git pull --ff-only https://example.invalid/r.git main",
+])
+def test_g1_third_review_bypasses_on_main_blocked(history, cmd):
+    assert run("branch_guard.py", bash(cmd, history))[0] == 2
+
+
+@pytest.mark.parametrize("cmd", [
+    "git fetch origin '+refs/heads/*:refs/remotes/origin/*'", "git fetch origin 'refs/tags/*:refs/tags/*'",
+    "git log -1 && git reset HEAD f.txt", "git status && git reset",
+])
+def test_g1_third_review_neighbours_allowed(history, cmd):
+    assert run("branch_guard.py", bash(cmd, history))[0] == 0
+
+
+def test_g1_aliases_from_settings_expanded(history):
+    git(history, "config", "alias.ci", "commit")
+    git(history, "config", "alias.pm", "push origin HEAD:main")
+    git(history, "config", "alias.fm", "!git branch -f main HEAD")
+    assert run("branch_guard.py", bash("git ci -m x", history))[0] == 2
+    git(history, "switch", "-q", "feat/x")
+    assert run("branch_guard.py", bash("git ci -m x", history))[0] == 0
+    assert run("branch_guard.py", bash("git pm", history))[0] == 2
+    assert run("branch_guard.py", bash("git fm", history))[0] == 2
+
+
+def test_g4_alias_for_commit_tested(project):
+    git(project, "config", "alias.ci", "commit")
+    (project / "calc.py").write_text(BROKEN)
+    git(project, "add", "calc.py")
+    code, err = gate("git ci -m x", project)
+    assert code == 2 and "1 failed" in err
+
+
 def test_g1_alias_or_external_command(history):
     """Что сделает алиас или git-<имя>, гейт не видит: на main и с push в main — стоп, как было на dev."""
     assert run("branch_guard.py", bash("git lfs ls-files", history))[0] == 0

@@ -7,6 +7,7 @@
 """
 import re
 import shlex
+import subprocess
 import warnings
 from dataclasses import dataclass, field
 
@@ -105,6 +106,17 @@ OPTIONS = {
                  "--verbose --intent-to-add --refresh --ignore-errors --ignore-missing --no-all --renormalize --sparse"),
     "rm": _opts("", "--pathspec-from-file", "--cached --dry-run --force --quiet --ignore-unmatch --sparse"),
 }
+# встроенные команды git (и git-lfs): всё прочее — алиас или внешняя git-<имя>
+BUILTINS = set(OPTIONS) | set("""
+    status log diff show add rm mv restore describe blame annotate grep shortlog help version show-ref cat-file
+    rev-list rev-parse ls-files ls-tree ls-remote name-rev merge-base for-each-ref check-ignore check-attr clean archive
+    count-objects format-patch range-diff whatchanged var hash-object write-tree diff-files diff-index diff-tree apply
+    show-branch cherry verify-commit verify-tag merge-tree merge-file interpret-trailers column check-ref-format config
+    tag reflog init clone bundle gc fsck prune repack submodule sparse-checkout mergetool difftool request-pull
+    read-tree commit-tree update-index maintenance replace credential pack-refs lfs bisect stash filter-branch
+    filter-repo fast-import fast-export subtree citool gui svn p4 http-push send-pack notes worktree remote fetch pull
+    push rebase reset switch checkout branch update-ref symbolic-ref commit merge cherry-pick revert am
+""".split())
 # где значение опции — текст сообщения: подстановка в нём законна (commit -m "$(cat <<'EOF' …)")
 MESSAGE_OPTS = {
     "commit": ("mF", {"--message", "--file"}),
@@ -148,15 +160,18 @@ def _config_pair(text):
     return key, value if eq else "true"
 
 
+# переменные перед git, которые подменяют настройки или хранилище ссылок целиком: что в них — гейту не видно
+ENV_OPAQUE = {"GIT_CONFIG", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_PARAMETERS", "GIT_COMMON_DIR",
+              "HOME", "XDG_CONFIG_HOME"}
+
+
 def _env_config(env):
     pairs = []
     for name, value in env.items():
         n = re.fullmatch(r"GIT_CONFIG_KEY_(\d+)", name)
         if n:
             pairs.append((value, env.get(f"GIT_CONFIG_VALUE_{n.group(1)}")))
-        elif name == "GIT_CONFIG_PARAMETERS":
-            pairs += [_config_pair(p) for p in value.split()]
-        elif name in ("GIT_CONFIG", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"):
+        elif name in ENV_OPAQUE:
             pairs.append(("*", None))
         elif name == "GIT_NOTES_REF":
             pairs.append(("core.notesref", value))
@@ -319,7 +334,7 @@ def _parse_git(words: list, rough: bool):
     where, glob, env, i, sub = [], [], {}, start + 1, m.group(1)
     for w0 in words[:start]:  # GIT_DIR=… git commit — то же, что git --git-dir=… commit
         name, eq, val = w0.partition("=")
-        if eq and name.startswith("GIT_"):
+        if eq and (name.startswith("GIT_") or name in ENV_OPAQUE):
             glob.append(w0)
             if name in ENV_LOCATION:
                 where.append(f"{ENV_LOCATION[name]}={val}")
@@ -383,6 +398,34 @@ def _substitutions(word: str):
 def _is_text(word: str) -> bool:
     m = CAT_HEREDOC.fullmatch(word)
     return bool(m) and m.group(1) not in (line.strip() for line in m.group(2).split("\n"))
+
+
+def _alias(call, cwd):
+    """Значение алиаса: из -c этой команды, иначе из настроек репозитория; не алиас — None."""
+    value = next((v for k, v in call.config if k.lower() == f"alias.{call.sub.lower()}"), None)
+    if value is None:
+        opts = [x for k, v in call.config if v is not None for x in ("-c", f"{k}={v}")]
+        r = subprocess.run(["git", *call.where, *opts, "config", "--get", f"alias.{call.sub}"], cwd=cwd,
+                           capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        value = r.stdout.strip() if r.returncode == 0 else None
+    return value or None
+
+
+def expand_aliases(calls, cwd, depth=0):
+    """Алиасы заменены тем, во что они раскрываются: git ci → git commit, «!…» — команда шелла."""
+    out = []
+    for call in calls:
+        value = _alias(call, cwd) if call.sub and call.sub not in BUILTINS and not call.dynamic and depth < 5 else None
+        if value is None:
+            out.append(call)
+            continue
+        args = " ".join(shlex.quote(w) for w in call.rest)
+        inner = list(git_calls(f"{value[1:]} {args}" if value.startswith("!") else f"git {value} {args}"))
+        for c in inner:  # -c и -C самой команды действуют и на то, во что раскрылся алиас
+            c.where = call.where + c.where
+            c.config = call.config + c.config
+        out += expand_aliases(inner, cwd, depth + 1)
+    return out
 
 
 def git_calls(text: str, depth: int = 0):

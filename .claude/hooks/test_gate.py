@@ -96,12 +96,16 @@ def run_tests(root, python):
 
 def main() -> int:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from shellwords import DYNAMIC, git_calls
+    from shellwords import DYNAMIC, expand_aliases, git_calls
 
     event = json.load(sys.stdin)
     if event.get("tool_name") not in ("Bash", "Monitor"):
         return 0
-    calls = list(git_calls(event.get("tool_input", {}).get("command", "")))
+    project = os.environ.get("CLAUDE_PROJECT_DIR") or "."
+    # cwd идёт за агентом, в том числе в worktree; CLAUDE_PROJECT_DIR остаётся в основной копии
+    cwd = event.get("cwd") or project
+    # алиас (git ci → git commit) проверяется как то, во что он раскрыт
+    calls = expand_aliases(list(git_calls(event.get("tool_input", {}).get("command", ""))), cwd)
     # подкоманда или репозиторий из подстановки: это может быть commit, и где — неизвестно
     dynamic = next((c for c in calls if c.dynamic and (not c.sub or DYNAMIC.search(c.sub) or
                                                        any(DYNAMIC.search(w) for w in c.where))), None)
@@ -122,9 +126,6 @@ def main() -> int:
         if c.dynamic and c.sub not in READONLY:
             raise Stop(f"в git {c.sub} слово {c.dynamic} берётся из переменной или подстановки — "
                        "гейт не может предсказать содержимое коммита.")
-    project = os.environ.get("CLAUDE_PROJECT_DIR") or "."
-    # cwd идёт за агентом, в том числе в worktree; CLAUDE_PROJECT_DIR остаётся в основной копии
-    cwd = event.get("cwd") or project
     top = git(cwd, commit.where, "rev-parse", "--show-toplevel").stdout.strip()
     venvs = [os.path.join(d, ".venv", "bin", "python") for d in (top or cwd, project)]
     python = next((v for v in venvs if os.path.exists(v)), sys.executable)

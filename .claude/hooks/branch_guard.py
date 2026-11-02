@@ -12,29 +12,32 @@ SWITCHED = "?"  # ветка после switch/checkout на существую�
 ON_BRANCH = {"commit", "merge", "cherry-pick", "revert", "am", "subtree", "citool", "gui", "svn", "p4"}
 # где решение зависит от текущей ветки или меняет её
 TRACKED = ON_BRANCH | {"reset", "pull", "push", "send-pack", "http-push", "rebase", "switch", "checkout", "branch",
-                       "update-ref", "symbolic-ref"}
+                       "update-ref", "symbolic-ref", "bisect", "stash"}
 # без ветки: решение по самой команде и настройкам репозитория
 UNTRACKED = {"worktree", "fetch", "remote", "config", "notes", "filter-branch", "filter-repo", "fast-import"}
 SYNC = "Синхронизация main с сервером — git pull --ff-only."
-# встроенные команды git, которые не двигают ветки; всё прочее — алиас или внешняя git-<имя>
-SAFE_BUILTINS = {
-    "status", "log", "diff", "show", "add", "rm", "mv", "restore", "stash", "tag", "describe", "blame", "grep",
-    "shortlog", "help", "version", "reflog", "show-ref", "cat-file", "rev-list", "rev-parse", "ls-files", "ls-tree",
-    "ls-remote", "name-rev", "merge-base", "for-each-ref", "check-ignore", "check-attr", "clean", "init", "clone",
-    "archive", "bisect", "bundle", "gc", "fsck", "prune", "repack", "count-objects", "submodule", "sparse-checkout",
-    "mergetool", "difftool", "format-patch", "request-pull", "range-diff", "whatchanged", "var", "hash-object",
-    "write-tree", "read-tree", "commit-tree", "update-index", "diff-files", "diff-index", "diff-tree", "apply",
-    "maintenance", "replace", "show-branch", "cherry", "verify-commit", "verify-tag", "credential", "blame", "annotate",
-    "merge-tree", "merge-file", "interpret-trailers", "column", "check-ref-format", "symbolic-ref", "pack-refs",
-    "lfs",
+# не меняют ни веток, ни других ссылок: после них ревизию для reset можно вычислить заранее
+REF_NEUTRAL = {
+    "status", "log", "diff", "show", "add", "rm", "mv", "restore", "describe", "blame", "annotate", "grep", "shortlog",
+    "help", "version", "show-ref", "cat-file", "rev-list", "rev-parse", "ls-files", "ls-tree", "ls-remote", "name-rev",
+    "merge-base", "for-each-ref", "check-ignore", "check-attr", "clean", "archive", "count-objects", "format-patch",
+    "range-diff", "whatchanged", "var", "hash-object", "write-tree", "diff-files", "diff-index", "diff-tree", "apply",
+    "show-branch", "cherry", "verify-commit", "verify-tag", "merge-tree", "merge-file", "interpret-trailers", "column",
+    "check-ref-format", "config",
 }
-# для алиаса и внешней команды — прежнее правило по словам: гейт не знает, что они сделают
-ALIAS_ON_MAIN = re.compile(r"\b(?:commit|merge|cherry-pick|revert|am|rebase|reset|pull)\b")
+# встроенные команды git, которые не двигают ветки; всё прочее — алиас или внешняя git-<имя>
+SAFE_BUILTINS = (REF_NEUTRAL | {
+    "tag", "reflog", "init", "clone", "bundle", "gc", "fsck", "prune", "repack", "submodule", "sparse-checkout",
+    "mergetool", "difftool", "request-pull", "read-tree", "commit-tree", "update-index", "maintenance", "replace",
+    "credential", "pack-refs", "lfs",
+}) - {"config"}  # config пишет настройки — проверяется отдельно
+# для внешней git-<имя> — прежнее правило dev по словам: гейт не знает, что она сделает
+ALIAS_ON_MAIN = re.compile(r"\b(?:commit|merge|cherry-pick|revert|am|rebase|reset|pull|push)\b")
 
 
 def protected(ref) -> bool:
-    """main, +main, heads/main, refs/heads/main — всё это main."""
-    ref = (ref or "").lstrip("+")
+    """main, +main, heads/main, refs/heads//main — всё это main; MAIN тоже: на macOS ссылки без регистра."""
+    ref = re.sub(r"/+", "/", (ref or "").lstrip("+")).lower()
     for prefix in ("refs/heads/", "heads/"):
         ref = ref.removeprefix(prefix)
     return ref in PROTECTED
@@ -46,18 +49,22 @@ def protected_upstream(ref) -> bool:
     return protected(ref) or protected(ref.partition("/")[2])
 
 
+def fetch_risk(spec) -> bool:
+    """Refspec fetch пишет в main чужую ветку или шаблоном — в локальные ветки."""
+    src, _, dst = spec.lstrip("+").partition(":")
+    wildcard = "*" in dst and not dst.startswith(("refs/remotes/", "refs/tags/"))
+    return wildcard or (protected(dst) and not protected(src))
+
+
 def config_risk(key, value):
     """Может ли настройка увести push, pull или fetch в main или перенести ветку. value None — значение не видно."""
     k = key.lower()
-    if k == "*":
+    if k == "*" or value is None:  # подменён файл настроек или значение — в переменной окружения
         return True
     if re.fullmatch(r"remote\..+\.(?:push|mirror)", k):
         return True
     if re.fullmatch(r"remote\..+\.fetch", k):
-        if value is None:
-            return True
-        src, _, dst = value.lstrip("+").partition(":")
-        return (protected(dst) and not protected(src)) or (dst.startswith("refs/heads/") and "*" in dst)
+        return fetch_risk(value)
     if k == "push.default":
         return value is None or value.lower() in ("upstream", "tracking", "matching")
     m = re.fullmatch(r"branch\.(.+)\.(merge|remote)", key, re.I)
@@ -65,8 +72,8 @@ def config_risk(key, value):
         return protected(m.group(1)) and not (m.group(2).lower() == "merge" and value is not None and protected(value))
     if k == "rebase.updaterefs":
         return value is None or value.lower() in ("true", "yes", "on", "1")
-    if k == "core.notesref":
-        return value is None or protected(value)
+    if k in ("core.notesref", "notes.rewriteref"):  # заметки — это коммиты в той ссылке, куда их пишут
+        return protected(value)
     return False
 
 
@@ -79,6 +86,12 @@ def settings(cwd, call, pattern):
     opts = [x for key, value in call.config if value is not None for x in ("-c", f"{key}={value}")]
     out = git(cwd, call.where + opts, "config", "--get-regexp", pattern).stdout
     return [tuple(line.partition(" ")[::2]) for line in out.splitlines()]
+
+
+def main_remote(cwd, call) -> str:
+    """Сервер, с которого main берёт историю: branch.main.remote, по умолчанию origin."""
+    found = [v for _, v in settings(cwd, call, r"^branch\.(main|master)\.remote$")]
+    return found[0] if found else "origin"
 
 
 def current_branch(cwd, where) -> str:
@@ -154,7 +167,15 @@ def check(call, branch, head, cwd):
         return f"в git {sub}: {what} — может увести push, pull или fetch в main. Без неё или через PR.", None
     if sub in ("switch", "checkout"):
         return switch(call)
+    if sub == "bisect":  # bisect отцепляет HEAD, bisect reset возвращает на ветку, с которой начинали
+        return None, "main" if ops[:1] == ["reset"] and any(map(protected, ops[1:])) else SWITCHED
+    if sub == "stash":  # stash branch <имя> — новая ветка и переключение на неё
+        if ops[:1] == ["branch"] and len(ops) > 1:
+            return None, "main" if protected(ops[1]) else ops[1]
+        return None, None
     if sub == "symbolic-ref":  # symbolic-ref HEAD refs/heads/main — переключение ветки без checkout
+        if ops and protected(ops[0]):
+            return "git symbolic-ref main …: main станет ссылкой на другую ветку — запрещено.", None
         if "HEAD" in ops and len(ops) > 1:
             return None, "main" if any(map(protected, ops)) else SWITCHED
         return None, None
@@ -202,9 +223,10 @@ def check(call, branch, head, cwd):
             return None, None
     if sub in ("fetch", "pull", "remote"):
         for spec in ops if sub != "remote" else []:
-            src, sep, dst = spec.partition(":")
-            if sep and protected(dst) and not protected(src):
-                return f"git {sub} {spec} записывает в main чужую ветку — запрещено.", None
+            if ":" in spec and fetch_risk(spec):
+                return f"git {sub} {spec} записывает в main чужую ветку или шаблоном — в локальные ветки.", None
+            if ":" in spec and protected(spec.partition(":")[2]) and ops[0] != main_remote(cwd, call):
+                return f"git {sub} {ops[0]} {spec}: main берётся только с её сервера ({main_remote(cwd, call)}).", None
         refmap = a.values.get("--refmap")
         if refmap and config_risk("remote.x.fetch", refmap):
             return f"git {sub} --refmap={refmap} записывает в main чужую ветку — запрещено.", None
@@ -268,8 +290,8 @@ def check(call, branch, head, cwd):
         if "--hard" in a.flags:
             return "git reset --hard на main запрещён. " + SYNC, None
         if a.pos and head != "HEAD":
-            # HEAD~1, @{-1}, HEAD@{1} гейт вычислил бы до переключения — а выполнятся они после
-            return "переключение на main и git reset на ревизию — разными командами.", None
+            # HEAD~1, @{-1}, origin/main гейт вычислил бы до switch, fetch или update-ref — а выполнятся они после
+            return "git reset на ревизию после команд, которые меняют ветку или ссылки, — разными командами.", None
         target = commit_of(cwd, call.where, a.pos[0]) if a.pos else None
         if target and target != commit_of(cwd, call.where, "HEAD"):
             return f"git reset {a.pos[0]} переносит main — запрещено. " + SYNC, None
@@ -281,6 +303,8 @@ def check(call, branch, head, cwd):
         for spec in ops[1:]:
             if not protected(spec.partition(":")[0]):
                 return f"git pull --ff-only {spec} вливает в main другую ветку — только через PR.", None
+        if ops and ops[0] != main_remote(cwd, call):  # чужой репозиторий или путь: его main — не наша main
+            return f"на main git pull --ff-only — только с её сервера ({main_remote(cwd, call)}).", None
         if len(ops) < 2:  # без ветки pull берёт её из branch.<ветка>.merge
             name = branch() if branch() != SWITCHED else "main"
             merge = [v for _, v in settings(cwd, call, rf"^branch\.{re.escape(name)}\.merge$")]
@@ -292,7 +316,7 @@ def check(call, branch, head, cwd):
 
 def main() -> int:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from shellwords import git_calls
+    from shellwords import BUILTINS, expand_aliases, git_calls
 
     event = json.load(sys.stdin)
     if event.get("tool_name") not in ("Bash", "Monitor"):
@@ -302,15 +326,18 @@ def main() -> int:
     # гейт смотрит до запуска, поэтому проходит команду по вызовам git и следит, на какой ветке окажется агент.
     # Ключ — git-папка рабочей копии: git -C . и git без -C — одна и та же копия
     repos, branches, moved = {}, {}, set()
-    for call in git_calls(cmd):
+    stale = False  # до этого вызова в команде были git-команды, которые могут сдвинуть ветки или ссылки
+    # алиас — из -c этой команды или из настроек — проверяется как то, во что он раскрыт
+    for call in expand_aliases(list(git_calls(cmd)), cwd):
         if call.dynamic:
             what = "подкоманда git" if call.dynamic == call.sub else f"в git {call.sub or ''} слово".replace("  ", " ")
             print(f"branch-guard: {what} {call.dynamic} берётся из переменной или подстановки — "
                   "гейт не видит, что выполнится. Напиши подкоманду, ветку и путь явно; "
                   "подстановка допустима только в тексте сообщения (-m, -F).", file=sys.stderr)
             return 2
-        unknown = call.sub not in TRACKED | UNTRACKED | SAFE_BUILTINS
-        if not unknown and call.sub not in TRACKED | UNTRACKED and not call.config:
+        unknown = call.sub not in BUILTINS  # внешняя git-<имя>: алиасы уже раскрыты
+        if call.sub in SAFE_BUILTINS:
+            stale = stale or call.sub not in REF_NEUTRAL
             continue
         where = tuple(call.where)
         if where not in repos:
@@ -323,7 +350,8 @@ def main() -> int:
                 branches[key] = current_branch(cwd, where)
             return branches[key]
 
-        head = "HEAD" if key not in moved else None
+        head = "HEAD" if key not in moved and not stale else None
+        stale = stale or call.sub not in REF_NEUTRAL
         reason, after = check(call, branch, head, cwd)
         if not reason and unknown:
             words = [f"{k}={v}" for k, v in call.config] + [call.sub] + call.rest
