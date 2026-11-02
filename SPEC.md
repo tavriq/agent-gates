@@ -39,7 +39,7 @@
 ## Гейты
 Хуки Claude Code в `.claude/hooks/`, срабатывают до действия агента. **Стоп** — хук возвращает код 2: действие не выполняется, агент получает сообщение. Защищённые ветки — `main` и `master`. Сценарии гейтов проверяются, если задача про `.claude/`.
 
-- **G1. branch-guard: история main — только через PR.** Стоп всему, что добавляет коммиты в main, переписывает её или переносит ветку. Синхронизация с сервером — `git pull --ff-only`.
+- **G1. branch-guard: история main — только через PR.** Стоп всему, что добавляет коммиты в main, переписывает её или переносит ветку. Синхронизация с сервером — `git pull --ff-only`. Равносильная запись решается так же, как полная: сокращённая длинная опция (`--har` — это `--hard`), аргументы после `--`, `-C .` и та же копия без `-C`, `heads/main` — это main.
 - **G2. Команда читается после снятия кавычек и экранирования.** `.en''v`, `.e\nv`, `".en"v`, `$'\x2eenv'` — это `.env`; `git co''mmit` — это `git commit`. Если в команде git подкоманда, путь к репозиторию (`-C`, `--git-dir`), ветка, путь или опция берутся из переменной или подстановки (`$x`, `${x}`, `$(…)`, `` `…` ``) — стоп с сообщением. Исключение — текст сообщения: `-m` и `-F` у commit, merge, tag, stash, notes. Полного разбора шелла нет: переменные не подставляются, `*` и `{a,b}` не раскрываются.
 - **G3. Гейт падает закрытым.** Нет `python3` в PATH, гейт упал или вернул код, отличный от 0 и 2, — стоп с сообщением, а не пропуск.
 - **G4. test-gate: тесты — по содержимому коммита.** Перед `git commit` тесты гоняются по снимку того, что уйдёт в коммит: индекс, плюс `git add` и `git rm`, выполненные той же командой до коммита, плюс `commit -a` и `commit <пути>`. Изменения рабочей копии, которые в коммит не попадут, на результат не влияют. Другая git-команда, меняющая индекс до коммита в той же команде, или два коммита в одной команде — стоп: содержимое коммита не предсказать.
@@ -58,18 +58,20 @@
 | G1.10 | main | `git pull --ff-only origin <другая ветка>` | стоп |
 | G1.11 | любая | `git switch -C main`, `git checkout -B main`, `git worktree add -B main` | стоп |
 | G1.12 | любая | `git branch -f main`, `git branch -m/-M/-c/-C <ветка> main`, `git branch -m main <имя>` | стоп |
-| G1.13 | любая | `git update-ref refs/heads/main …`, `git update-ref --stdin` | стоп |
+| G1.13 | любая | `git update-ref refs/heads/main …`, `git update-ref --stdin`, `git fast-import` | стоп |
 | G1.14 | любая | `git fetch <remote> <ветка>:main`, источник — не main | стоп |
 | G1.15 | любая | push в main: с main, `origin main`, `HEAD:main`, `+main`, `refs/heads/main`, `--all`, `--mirror`, `*` | стоп |
 | G1.16 | main | `--abort` у rebase, merge, cherry-pick, revert, am | можно |
 | G1.17 | любая | переключиться на существующую ветку и коммит, push, reset одной командой | стоп |
-| G1.18 | main | `git filter-branch`; на любой ветке — `git filter-branch --all` | стоп |
+| G1.18 | любая | `git filter-branch …`, `git filter-repo …` — переписывают историю тех веток, что выберут их аргументы | стоп |
 | G1.19 | ветка | commit, merge, `rebase main`, `reset --hard`, `pull`, push своей ветки | можно |
-| G2.1 | — | `cat .en''v`, `cat .e\nv`, `cat ".en"v`, `cat $'\x2eenv'` | стоп |
+| G1.20 | ветка | `git symbolic-ref HEAD refs/heads/main && git commit` — переключение на main без checkout | стоп |
+| G1.21 | ветка | push в main через настройку: `git -c remote.origin.push=HEAD:main push`, `git config remote.origin.push …`, `git config push.default …`; `git send-pack` — как push. Чтение настройки — можно | стоп |
+| G2.1 | — | `cat .en''v`, `cat .e\nv`, `cat ".en"v`, `cat $'\x2eenv'`, `cat .e$"n"v` | стоп |
 | G2.2 | main | `git co''mmit`, `git "com"mit`, `git com\mit` | стоп |
 | G2.3 | любая | `c=commit; git $c`, `git $(printf com)mit` | стоп, сообщение «из переменной или подстановки» |
-| G2.4 | ветка | `git -C "$dir" commit`, `b=main; git push origin $b` | стоп |
-| G2.5 | ветка | `git commit -m "$(cat <<'EOF' … EOF)"`, в тексте — что угодно | можно |
+| G2.4 | ветка | `git -C "$dir" commit`, `git -C $(pwd) commit`, `b=main; git push origin $b` | стоп |
+| G2.5 | ветка | `git commit -m "$(cat <<'EOF' … EOF)"` (или `<<"EOF"`), в тексте — что угодно, в том числе кавычки и `$` | можно |
 | G3.1 | — | хук из `.claude/settings.json`, `python3` нет в PATH | стоп, сообщение «python3 не найден» |
 | G3.2 | — | интерпретатор упал до гейта (код 1) | стоп |
 | G4.1 | красное в индексе, в рабочей копии исправлено и не добавлено | `git commit` | стоп |

@@ -95,10 +95,12 @@ def main() -> int:
     if event.get("tool_name") not in ("Bash", "Monitor"):
         return 0
     calls = list(git_calls(event.get("tool_input", {}).get("command", "")))
-    dynamic = next((c for c in calls if DYNAMIC.search(c.sub)), None)
+    # подкоманда или репозиторий из подстановки: это может быть commit, и где — неизвестно
+    dynamic = next((c for c in calls if c.dynamic and (not c.sub or DYNAMIC.search(c.sub) or
+                                                       any(DYNAMIC.search(w) for w in c.where))), None)
     if dynamic:
-        raise Stop(f"подкоманда git {dynamic.sub} берётся из переменной или подстановки — может оказаться commit. "
-                   "Напиши её явно.")
+        raise Stop(f"в git {dynamic.dynamic} берётся из переменной или подстановки — может оказаться commit "
+                   "или другой репозиторий. Напиши подкоманду и путь явно.")
     commits = [i for i, c in enumerate(calls) if c.sub == "commit"]
     if not commits:
         return 0

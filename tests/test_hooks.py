@@ -304,10 +304,68 @@ def test_g1_amend_and_merge_on_main_blocked(history, cmd):
 @pytest.mark.parametrize("cmd", [
     "git pull --ff-only", "git pull --ff-only origin", "git pull --ff-only origin main",
     "git reset", "git reset f.txt", "git reset -- f.txt", "git reset HEAD f.txt", "git reset --soft HEAD",
-    "git rebase main feat/x", "git merge --abort", "git cherry-pick --abort", "git status && git log -1",
+    "git rebase main feat/x", "git merge --abort", "git cherry-pick --abort", "git revert --abort", "git am --abort",
+    "git status && git log -1",
 ])
 def test_g1_sync_and_unstage_on_main_allowed(history, cmd):
     assert run("branch_guard.py", bash(cmd, history))[0] == 0
+
+
+# G1: равносильные записи тех же команд — сокращённые опции, «--», heads/main, -C . (найдено на приёмке)
+
+@pytest.fixture
+def diverged(on_feature):
+    """feat/x на коммит впереди main, HEAD — на feat/x."""
+    (on_feature / "f.txt").write_text("x\n")
+    commit_all(on_feature, "x")
+    return on_feature
+
+
+@pytest.mark.parametrize("cmd", [
+    "git rebase -- feat/x main", "git rebase --whitespace fix feat/x main", "git rebase -C 1 feat/x main",
+    "git rebase --empty drop feat/x main", "git rebase --ont feat/x HEAD~1 main", "git rebase --roo main",
+    "git switch --force-c main", "git branch -f -- main HEAD", "git branch -M -- feat/x main",
+    "git branch --forc main HEAD", "git branch --mov --forc feat/x main",
+    "git update-ref -- refs/heads/main HEAD", "git update-ref --std",
+    "git fetch -- . feat/x:main", "git push origin HEAD:heads/main", "git push --al origin", "git push --mirr origin",
+    "git filter-branch --tree-filter true -- --branches", "git filter-branch --tree-filter true -- --glob=refs/heads/*",
+])
+def test_g1_equivalent_spelling_from_feature_blocked(diverged, cmd):
+    assert run("branch_guard.py", bash(cmd, diverged))[0] == 2
+
+
+@pytest.mark.parametrize("cmd", [
+    "git reset --har", "git reset --har HEAD~1", "git pull --ff-only -- . feat/x", "git push origin HEAD", "git push",
+])
+def test_g1_equivalent_spelling_on_main_blocked(history, cmd):
+    assert run("branch_guard.py", bash(cmd, history))[0] == 2
+
+
+@pytest.mark.parametrize("cmd", [
+    "git switch main && git reset --soft feat/x", "git switch main && git reset --mixed feat/x",
+    "git switch main && git reset --keep feat/x",
+    "git -C . switch main && git commit -m x", "git switch main && git -C . commit -m x",
+    "git -C . checkout main && git merge feat/x", "git switch main && git -C . push origin HEAD",
+    "git switch feat/y && git commit -m x", "git checkout feat/y && git push origin HEAD",
+])
+def test_g1_branch_tracked_through_switch(diverged, cmd):
+    assert run("branch_guard.py", bash(cmd, diverged))[0] == 2
+
+
+@pytest.mark.parametrize("cmd", [
+    "git symbolic-ref HEAD refs/heads/main && git commit -m x",
+    "git -c remote.origin.push=HEAD:main push", "git config remote.origin.push HEAD:main",
+    "git config set push.default upstream", "git config --add remote.origin.push HEAD:main",
+    "git send-pack origin HEAD:main", "git send-pack --all origin",
+    "git fast-import", "git filter-repo --force",
+])
+def test_g1_main_moved_by_plumbing_or_config_blocked(diverged, cmd):
+    assert run("branch_guard.py", bash(cmd, diverged))[0] == 2
+
+
+@pytest.mark.parametrize("cmd", ["git config push.default", "git config --get remote.origin.push", "git config user.email t@t"])
+def test_g1_reading_config_allowed(diverged, cmd):
+    assert run("branch_guard.py", bash(cmd, diverged))[0] == 0
 
 
 @pytest.mark.parametrize("cmd", [
@@ -323,6 +381,7 @@ def test_g1_work_on_feature_allowed(on_feature, cmd):
 
 @pytest.mark.parametrize("cmd", [
     "cat .en''v", "cat .e\\nv", 'cat ".en"v', "cat $'\\x2eenv'", "cat $'\\056env'", "head .e''nv.local",
+    'cat .e$"n"v',
 ])
 def test_g2_quoted_secret_blocked(cmd):
     assert run("secret_guard.py", bash(cmd))[0] == 2
@@ -348,10 +407,25 @@ def test_g2_target_from_variable_blocked(on_feature, cmd):
     assert run("branch_guard.py", bash(cmd, on_feature))[0] == 2
 
 
+UNQUOTED_SUBSTITUTION = [
+    "git -C $(pwd) commit -m x", "git --git-dir=$(pwd)/.git commit -m x", "git -C $(git rev-parse --show-toplevel) commit -m x",
+]
+
+
+@pytest.mark.parametrize("cmd", UNQUOTED_SUBSTITUTION)
+def test_g2_unquoted_substitution_in_path_blocked(history, cmd):
+    assert run("branch_guard.py", bash(cmd, history))[0] == 2
+
+
 HEREDOC_MESSAGE = "git commit -m \"$(cat <<'EOF'\nfix: git push origin main; don't touch $HOME\nEOF\n)\""
+# кавычки внутри текста heredoc — обычное дело для сообщения коммита
+QUOTED_HEREDOC = ("git commit -m \"$(cat <<'EOF'\nsay \"hi there\", cost $5 and \"quoted $HOME\"\n"
+                  "fix(gates): закрыть обход \"git push origin HEAD:main\"\nEOF\n)\"")
+MESSAGES = [HEREDOC_MESSAGE, QUOTED_HEREDOC, QUOTED_HEREDOC.replace("<<'EOF'", '<<"EOF"'),
+            'git commit -m "fix: $x, git push origin main"']
 
 
-@pytest.mark.parametrize("cmd", [HEREDOC_MESSAGE, 'git commit -m "fix: $x, git push origin main"', "git log --oneline -3"])
+@pytest.mark.parametrize("cmd", MESSAGES + ["git log --oneline -3"])
 def test_g2_commit_message_is_text(on_feature, cmd):
     assert run("branch_guard.py", bash(cmd, on_feature))[0] == 0
 
@@ -470,3 +544,21 @@ def test_g4_green_commit_allowed_and_index_untouched(project):
     (project / "calc.py").write_text(CALC + "# ok\n")
     assert gate('git add -A && git commit -m "x"', project)[0] == 0
     assert git(project, "diff", "--cached", "--quiet").returncode == 0
+
+
+def test_g4_abbreviated_include_tested(project):
+    (project / "test_calc.py").write_text(TEST_CALC + "\n\ndef test_red():\n    assert False\n")
+    git(project, "add", "test_calc.py")
+    (project / "calc.py").write_text(CALC + "# ok\n")
+    code, err = gate("git commit --inc -m x calc.py", project)
+    assert code == 2 and "1 failed" in err
+
+
+@pytest.mark.parametrize("cmd", MESSAGES)
+def test_g4_heredoc_message_with_quotes_allowed(project, cmd):
+    assert gate(cmd, project)[0] == 0
+
+
+@pytest.mark.parametrize("cmd", UNQUOTED_SUBSTITUTION[:2])
+def test_g4_repo_from_substitution_blocked(project, cmd):
+    assert gate(cmd, project)[0] == 2
