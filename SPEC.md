@@ -35,3 +35,52 @@
 |---|---|---|---|
 | S9 | `hourly`, 400 ₽/ч | стоянка 20:00–04:00 (8 ч, из них 6 ночных) | плата 3 680 ₽: 2 ч × 400 + 6 ч × 480 |
 | S10 | `hourly`, 400 ₽/ч | стоянка 18:00–08:00 (14 ч) | плата 5 440 ₽ за первые 12 ч: 4 ч × 400 + 8 ч × 480; `long = true` |
+
+## Гейты
+Хуки Claude Code в `.claude/hooks/`, срабатывают до действия агента. **Стоп** — хук возвращает код 2: действие не выполняется, агент получает сообщение. Защищённые ветки — `main` и `master`. Сценарии гейтов проверяются, если задача про `.claude/`.
+
+- **G1. branch-guard: история main — только через PR.** Стоп всему, что добавляет коммиты в main, переписывает её или переносит ветку. Синхронизация с сервером — `git pull --ff-only`. Равносильная запись решается так же, как полная: сокращённая длинная опция (`--har` — это `--hard`), аргументы после `--`, `-C .` и та же копия без `-C`, `heads/main` — это main.
+- **G2. Команда читается после снятия кавычек и экранирования.** `.en''v`, `.e\nv`, `".en"v`, `$'\x2eenv'` — это `.env`; `git co''mmit` — это `git commit`. Если в команде git подкоманда, путь к репозиторию (`-C`, `--git-dir`), ветка, путь или опция берутся из переменной или подстановки (`$x`, `${x}`, `$(…)`, `` `…` ``) — стоп с сообщением. Исключение — текст сообщения: `-m` и `-F` у commit, merge, tag, stash, notes. Полного разбора шелла нет: переменные не подставляются, `*` и `{a,b}` не раскрываются.
+- **G3. Гейт падает закрытым.** Нет `python3` в PATH, гейт упал или вернул код, отличный от 0 и 2, — стоп с сообщением, а не пропуск.
+- **G4. test-gate: тесты — по содержимому коммита.** Перед `git commit` тесты гоняются по снимку того, что уйдёт в коммит: индекс, плюс `git add` и `git rm`, выполненные той же командой до коммита, плюс `commit -a` и `commit <пути>`. Изменения рабочей копии, которые в коммит не попадут, на результат не влияют. Другая git-команда, меняющая индекс до коммита в той же команде, или два коммита в одной команде — стоп: содержимое коммита не предсказать.
+
+| # | Дано: ветка или состояние | Команда | Ожидание |
+|---|---|---|---|
+| G1.1 | main | `git commit`, в том числе `--amend` | стоп |
+| G1.2 | main | `git merge <ветка>`, `git cherry-pick`, `git revert`, `git am`, `git subtree`, `git citool` | стоп |
+| G1.3 | main | `git rebase …`; посреди rebase main — `git rebase --continue`, `git commit` | стоп |
+| G1.4 | любая | `git rebase <база> main`, `git rebase --root main` | стоп |
+| G1.5 | main | `git reset --hard [<ревизия>]` | стоп |
+| G1.6 | main | `git reset [--soft\|--mixed\|--keep\|--merge] <ревизия>`, ревизия ≠ HEAD; reset на ревизию после команды той же строки, которая может сдвинуть ссылки (`git fetch && git reset --soft origin/main`) | стоп |
+| G1.7 | main | `git reset`, `git reset <путь>`, `git reset -- <путь>` — снять с индекса | можно |
+| G1.8 | main | `git pull`, `git pull --rebase` | стоп |
+| G1.9 | main | `git pull --ff-only`, `git pull --ff-only origin main` — с сервера main (`branch.main.remote`, по умолчанию origin) | можно |
+| G1.10 | main | `git pull --ff-only origin <другая ветка>`; `git pull --ff-only`, когда upstream main (`branch.main.merge`) — другая ветка; `git pull --ff-only <другой репозиторий или путь> main` | стоп |
+| G1.11 | любая | `git switch -C main`, `git checkout -B main`, `git worktree add -B main` | стоп |
+| G1.12 | любая | `git branch -f main`, `git branch -m/-M/-c/-C <ветка> main`, `git branch -m main <имя>`; `MAIN` — тоже main: на macOS ссылки без регистра | стоп |
+| G1.13 | любая | `git update-ref refs/heads/main …`, `git update-ref --stdin`, `git fast-import`, `git symbolic-ref refs/heads/main <ветка>` | стоп |
+| G1.14 | любая | `git fetch <remote> <ветка>:main`, источник — не main; refspec с шаблоном в локальные ветки (`'refs/heads/*:refs/heads/*'`); `main:main` не с сервера main; fetch и pull, когда так велит настройка `remote.*.fetch` | стоп |
+| G1.15 | любая | push в main: с main, `origin main`, `HEAD:main`, `+main`, `refs/heads/main`, `--all`, `--mirror`, `*` | стоп |
+| G1.16 | main | `--abort` у rebase, merge, cherry-pick, revert, am | можно |
+| G1.17 | любая | переключиться на существующую ветку (switch, checkout, `bisect reset`, `bisect start`) и коммит, push, reset одной командой; `git worktree add wt main && git -C wt commit`; переключиться на main и `git reset <ревизия>` одной командой — `HEAD~1`, `@{-1}` вычисляются уже после переключения | стоп |
+| G1.18 | любая | `git filter-branch …`, `git filter-repo …` — переписывают историю тех веток, что выберут их аргументы | стоп |
+| G1.19 | ветка | commit, merge, `rebase main`, `reset --hard`, `pull`, push своей ветки | можно |
+| G1.20 | ветка | `git symbolic-ref [-m …] HEAD refs/heads/main && git commit` — переключение на main без checkout | стоп |
+| G1.21 | ветка | push, pull или fetch в main через настройку: `-c`, `--config-env`, `GIT_CONFIG_*`, `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_PARAMETERS`, `GIT_COMMON_DIR`, `HOME`, `XDG_CONFIG_HOME` перед git, запись `git config` (`remote.*.push`, `remote.*.mirror`, `remote.*.fetch` в ветку main, `push.default upstream/matching`, `branch.main.merge`), `git remote add --mirror`. Уже записанные настройки гейт читает перед push, pull и fetch. `git send-pack`, в том числе `--stdin`, — как push. Чтение и удаление настройки — можно | стоп |
+| G1.22 | ветка | `git rebase --update-refs` и `rebase.updateRefs`; `git notes --ref=refs/heads/main`, `GIT_NOTES_REF` и `notes.rewriteRef`; `git branch -u <не main> main`; `git fetch --refmap=…:refs/heads/main`; `git subtree push … main`, `git subtree split --branch main`; `git http-push … :main` — переносят main или готовят перенос | стоп |
+| G1.23 | любая | алиас — из `-c alias.…` или из настроек, в том числе «!команда шелла» — проверяется как то, во что раскрыт; внешняя `git-<имя>` на main со словами commit, merge, reset, push… или с push в main; опечатка в подкоманде при `help.autocorrect` (git сам выполнит похожую встроенную) | стоп по правилам раскрытой команды |
+| G2.1 | — | `cat .en''v`, `cat .e\nv`, `cat ".en"v`, `cat $'\x2eenv'`, `cat .e$"n"v` | стоп |
+| G2.2 | main | `git co''mmit`, `git "com"mit`, `git com\mit` | стоп |
+| G2.3 | любая | `c=commit; git $c`, `git $(printf com)mit` | стоп, сообщение «из переменной или подстановки» |
+| G2.4 | ветка | `git -C "$dir" commit`, `git -C $(pwd) commit`, `b=main; git push origin $b` | стоп |
+| G2.5 | ветка | `git commit -m "$(cat <<'EOF' … EOF)"` (или `<<"EOF"`), в тексте — что угодно, в том числе кавычки и `$` | можно |
+| G2.6 | любая | `#` посреди слова — не комментарий: `git status a#b; git commit`, `echo $# && …`, `… https://x/y#readme && git push origin HEAD:main` — команда после `#` проверяется | по правилам этой команды |
+| G2.7 | любая | разбор не теряет части команды: `\` + перевод строки склеивает строки, а `\\` + перевод строки и `\` в теле `<<'EOF'` — нет; комментарий — только `#` в начале слова (`#'` — комментарий, а не кавычка); `')'` в кавычках не закрывает `$(…)`; `X=git` — присваивание, а не git; кавычка без пары ниже не прячет строки выше; вложенность `sh -c` глубже 8 — стоп | по правилам каждой команды |
+| G3.1 | — | хук из `.claude/settings.json`, `python3` нет в PATH | стоп, сообщение «python3 не найден» |
+| G3.2 | — | интерпретатор упал до гейта (код 1) | стоп |
+| G4.1 | красное в индексе, в рабочей копии исправлено и не добавлено | `git commit` | стоп |
+| G4.2 | в индексе зелёное, в рабочей копии сломано и не добавлено | `git commit` | можно |
+| G4.3 | рабочая копия красная | `git add -A && git commit`, `git commit -a` | стоп |
+| G4.4 | тест зависит от неотслеживаемого файла | `git commit -a` | стоп: файл в коммит не уйдёт |
+| G4.5 | в индексе красный тест, путь коммита — другой файл | `git commit <путь>` | можно |
+| G4.6 | — | `git stash && git commit`, `git commit && git commit`, `GIT_INDEX_FILE=… git commit` | стоп |
